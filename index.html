@@ -1,0 +1,1001 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Grove Brawlers</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #0d0d16;
+    color: #eee;
+    font-family: 'Courier New', monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding-bottom: 20px;
+  }
+  h1 {
+    margin: 10px 0 4px 0;
+    font-size: 20px;
+    letter-spacing: 2px;
+    color: #f4d35e;
+    text-shadow: 2px 2px #000;
+  }
+  #gameCanvas {
+    background: #3a2a1e;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    border: 4px solid #3a3a52;
+    box-shadow: 0 0 20px rgba(0,0,0,0.6);
+  }
+  #hud {
+    width: 960px;
+    background: #16162a;
+    border: 2px solid #3a3a52;
+    border-top: none;
+    padding: 6px;
+    display: flex;
+    gap: 6px;
+  }
+  .charPanel {
+    flex: 1;
+    padding: 6px 8px;
+    border: 2px solid #3a3a52;
+    border-radius: 4px;
+    background: #1f1f38;
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .charPanel.active {
+    border-color: #f4d35e;
+    box-shadow: 0 0 8px rgba(244,211,94,0.6);
+    background: #292950;
+  }
+  .charName { font-size: 13px; font-weight: bold; }
+  .charName span { color: #9aa; font-weight: normal; }
+  .barBg {
+    background: #333;
+    height: 7px;
+    border-radius: 2px;
+    overflow: hidden;
+    margin: 2px 0;
+    border: 1px solid #000;
+  }
+  .barFill { height: 100%; transition: width 0.15s linear; }
+  .hpFill { background: linear-gradient(#f66,#c33); }
+  .rageFill { background: linear-gradient(#ffe66d,#e09f3e); }
+  #controls {
+    width: 960px;
+    text-align: center;
+    font-size: 11px;
+    color: #888;
+    margin-top: 6px;
+    background: #16162a;
+    border: 2px solid #3a3a52;
+    padding: 4px;
+  }
+  .dead { opacity: 0.4; }
+</style>
+</head>
+<body>
+<h1>GROVE BRAWLERS</h1>
+<canvas id="gameCanvas" width="960" height="540"></canvas>
+<div id="hud"></div>
+<div id="controls">
+  WASD / Arrows: Move &nbsp;|&nbsp; SPACE / Z: Attack (combo) &nbsp;|&nbsp; E: Special &nbsp;|&nbsp; C / Shift: Roll / Dodge
+  &nbsp;|&nbsp; 1 / 2 / 3: Switch Hero &nbsp;|&nbsp; R: Restart when party falls
+</div>
+
+<script>
+/* =====================================================================================
+   GROVE BRAWLERS
+   A single-file real-time side-view brawler prototype, in the spirit of Secret of Mana,
+   Golden Axe / Golden Axe II & III, Knights of the Round, and Dragon's Crown.
+
+   -------------------------------------------------------------------------------------
+   REAL SPRITE ANIMATIONS
+   -------------------------------------------------------------------------------------
+   Unlike a placeholder-shapes prototype, this build uses the user's ACTUAL sprite
+   sheets (Attack / Death / Hurt / Idle / Walk grids), sliced at runtime straight out of
+   embedded base64 PNGs. Each sheet is described by a small ANIM_DATA entry:
+
+     rows: { attack: {row, x0, pitch, count}, death: {...}, hurt: {...}, idle: {...}, walk: {...} }
+
+   `row` is which horizontal band (0=Attack,1=Death,2=Hurt,3=Idle,4=Walk), `x0` is the
+   pixel x where that row's frames begin, `pitch` is the per-frame slot width, and
+   `count` is how many frames are in that row. Frame rects were derived by automated
+   pixel analysis of each sheet's grid, so they're close but not laser-precise -- nudge
+   x0/pitch/count for any character if you want pixel-perfect framing.
+
+   To add a new animated character:
+     1. Base64-encode your sheet's PNG and add it to SHEET_SOURCES.
+     2. Add an ANIM_DATA entry describing its row layout (row height = image height / 5).
+     3. Add a HERO_DEFS or ENEMY_DEFS entry pointing at the new anim key.
+   ===================================================================================== */
+
+// ---------------------------------------------------------------------------
+// CANVAS SETUP
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+const CANVAS_W = canvas.width;
+const CANVAS_H = canvas.height;
+
+// Playable floor band (Golden Axe style: characters roam a shallow horizontal strip,
+// not the full screen height, to simulate a 2.5D "lane").
+const FLOOR_TOP = 200;
+const FLOOR_BOTTOM = 500;
+
+// ---------------------------------------------------------------------------
+// UTILITIES
+// ---------------------------------------------------------------------------
+function rand(min, max) { return Math.random() * (max - min) + min; }
+function randInt(min, max) { return Math.floor(rand(min, max + 1)); }
+function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+function dist(x1, y1, x2, y2) { return Math.hypot(x2 - x1, y2 - y1); }
+
+// ---------------------------------------------------------------------------
+// SPRITE SHEET DATA  (base64 payloads injected below)
+// ---------------------------------------------------------------------------
+const SHEET_SOURCES = {
+  rogue:      "__ROGUE_B64__",
+  rogueextra: "__ROGUEEXTRA_B64__",
+  cowboy:     "__COWBOY_B64__",
+  ninja:      "__NINJA_B64__",
+  goblin:     "__GOBLIN_B64__",
+  slime:      "__SLIME_B64__",
+  slug:       "__SLUG_B64__",
+  frost:      "__FROST_B64__",
+  bandit:     "__BANDIT_B64__",
+};
+
+const IMAGES = {};
+for (const key in SHEET_SOURCES) {
+  const img = new Image();
+  img.src = "data:image/png;base64," + SHEET_SOURCES[key];
+  IMAGES[key] = img;
+}
+
+// row = 0 Attack, 1 Death, 2 Hurt, 3 Idle, 4 Walk  (5-row grid, shared by every
+// character/enemy sheet below). rogueextra uses its own 6-row layout instead.
+const ANIM_DATA = {
+  rogue:  { sheet: 'rogue',  rowH: 192, rows: {
+    attack: { row: 0, x0: 448, pitch: 193, count: 4 },
+    death:  { row: 1, x0: 435, pitch: 193, count: 4 },
+    hurt:   { row: 2, x0: 456, pitch: 190, count: 2 },
+    idle:   { row: 3, x0: 448, pitch: 193, count: 4 },
+    walk:   { row: 4, x0: 461, pitch: 190, count: 5 },
+  }},
+  // Bonus animation sheet for Kael: row 0 = Jump Attack (special), row 2 = Roll (dodge).
+  rogueextra: { sheet: 'rogueextra', rowH: 192, rows: {
+    jumpattack: { row: 0, x0: 472, pitch: 193, count: 5 },
+    roll:       { row: 2, x0: 472, pitch: 193, count: 4 },
+  }},
+  cowboy: { sheet: 'cowboy', rowH: 98, rows: {
+    attack: { row: 0, x0: 224, pitch: 96, count: 4 },
+    death:  { row: 1, x0: 224, pitch: 96, count: 4 },
+    hurt:   { row: 2, x0: 224, pitch: 97, count: 2 },
+    idle:   { row: 3, x0: 224, pitch: 98, count: 4 },
+    walk:   { row: 4, x0: 210, pitch: 96, count: 4 },
+  }},
+  ninja:  { sheet: 'ninja', rowH: 96, rows: {
+    attack: { row: 0, x0: 216, pitch: 96,  count: 4 },
+    death:  { row: 1, x0: 213, pitch: 96,  count: 5 },
+    hurt:   { row: 2, x0: 216, pitch: 100, count: 2 },
+    idle:   { row: 3, x0: 216, pitch: 97,  count: 4 },
+    walk:   { row: 4, x0: 234, pitch: 94,  count: 5 },
+  }},
+  goblin: { sheet: 'goblin', rowH: 96, rows: {
+    attack: { row: 0, x0: 192, pitch: 86, count: 6 },
+    death:  { row: 1, x0: 192, pitch: 89, count: 6 },
+    hurt:   { row: 2, x0: 192, pitch: 82, count: 2 },
+    idle:   { row: 3, x0: 192, pitch: 85, count: 4 },
+    walk:   { row: 4, x0: 192, pitch: 86, count: 6 },
+  }},
+  slime:  { sheet: 'slime', rowH: 96, rows: {
+    attack: { row: 0, x0: 273, pitch: 74, count: 6 },
+    death:  { row: 1, x0: 274, pitch: 75, count: 6 },
+    hurt:   { row: 2, x0: 275, pitch: 80, count: 2 },
+    idle:   { row: 3, x0: 272, pitch: 72, count: 6 },
+    walk:   { row: 4, x0: 276, pitch: 73, count: 6 },
+  }},
+  slug:   { sheet: 'slug', rowH: 96, rows: {
+    attack: { row: 0, x0: 199, pitch: 86, count: 6 },
+    death:  { row: 1, x0: 199, pitch: 87, count: 6 },
+    hurt:   { row: 2, x0: 199, pitch: 84, count: 2 },
+    idle:   { row: 3, x0: 199, pitch: 87, count: 6 },
+    walk:   { row: 4, x0: 200, pitch: 87, count: 6 },
+  }},
+  frost:  { sheet: 'frost', rowH: 192, rows: {
+    attack: { row: 0, x0: 440, pitch: 193, count: 4 },
+    death:  { row: 1, x0: 424, pitch: 190, count: 5 },
+    hurt:   { row: 2, x0: 451, pitch: 184, count: 2 },
+    idle:   { row: 3, x0: 440, pitch: 192, count: 4 },
+    walk:   { row: 4, x0: 467, pitch: 191, count: 5 },
+  }},
+  bandit: { sheet: 'bandit', rowH: 192, rows: {
+    attack: { row: 0, x0: 470, pitch: 194, count: 4 },
+    death:  { row: 1, x0: 459, pitch: 197, count: 4 },
+    hurt:   { row: 2, x0: 481, pitch: 181, count: 2 },
+    idle:   { row: 3, x0: 473, pitch: 193, count: 4 },
+    walk:   { row: 4, x0: 470, pitch: 196, count: 4 },
+  }},
+};
+
+// ---------------------------------------------------------------------------
+// HERO / ENEMY DEFINITIONS
+// ---------------------------------------------------------------------------
+// FUTURE: add more heroes/enemies here. `ranged: true` heroes fire a projectile
+// instead of doing a melee hitbox check on attack.
+const HERO_DEFS = {
+  rogue: {
+    name: 'Kael', role: 'Rogue', animKey: 'rogue',
+    destW: 74, destH: 104, maxHp: 100, speed: 165,
+    atkDamage: 11, atkRange: 46, comboMax: 3, attackCooldown: 0.30,
+    hasSpecial: true, specialAnim: 'rogueextra', specialRow: 'jumpattack',
+    hasRoll: true, rollAnim: 'rogueextra', rollRow: 'roll',
+  },
+  cowboy: {
+    name: 'Roy', role: 'Gunslinger', animKey: 'cowboy',
+    destW: 62, destH: 92, maxHp: 85, speed: 150,
+    atkDamage: 9, ranged: true, atkRange: 520, comboMax: 1, attackCooldown: 0.38,
+    hasSpecial: true, // reuses its own attack sprite for a 3-shot burst special
+    hasRoll: true,     // reuses its own walk sprite for a quick dash-dodge
+  },
+  ninja: {
+    name: 'Shiro', role: 'Blade Dancer', animKey: 'ninja',
+    destW: 66, destH: 100, maxHp: 115, speed: 145,
+    atkDamage: 15, atkRange: 52, comboMax: 3, attackCooldown: 0.34,
+    hasSpecial: true, hasRoll: true,
+  },
+};
+
+const ENEMY_DEFS = {
+  goblin: { animKey: 'goblin', destW: 58, destH: 78, hp: 42, speed: 90, damage: 8,  atkRange: 40, scoreVal: 50 },
+  slime:  { animKey: 'slime',  destW: 46, destH: 58, hp: 22, speed: 105, damage: 5, atkRange: 32, scoreVal: 25 },
+  slug:   { animKey: 'slug',   destW: 54, destH: 70, hp: 58, speed: 60,  damage: 10, atkRange: 40, scoreVal: 70 },
+  bandit: { animKey: 'bandit', destW: 72, destH: 98, hp: 66, speed: 78,  damage: 12, atkRange: 44, scoreVal: 90 },
+  frost:  { animKey: 'frost',  destW: 78, destH: 102, hp: 95, speed: 65, damage: 16, atkRange: 46, scoreVal: 130 },
+};
+const ENEMY_TYPE_KEYS = Object.keys(ENEMY_DEFS);
+
+// ---------------------------------------------------------------------------
+// ENTITY FACTORIES
+// ---------------------------------------------------------------------------
+function makeHero(key, x, y) {
+  const d = HERO_DEFS[key];
+  return {
+    heroKey: key, isHero: true,
+    name: d.name, role: d.role, animKey: d.animKey, def: d,
+    x, y, facingLeft: false, moving: false,
+    hp: d.maxHp, maxHp: d.maxHp,
+    animState: 'idle', animFrame: 0, animTimer: 0,
+    attackCooldownTimer: 0, comboStage: 0, comboWindowTimer: 0,
+    pendingHit: false, hitDelay: 0, hitDamage: 0, hitRangeMult: 1,
+    invuln: 0, rolling: false, rollTimer: 0, rollDir: { x: 0, y: 0 },
+    rage: 0, maxRage: 100,
+    alive: true, state: 'active', // active | dying | down
+  };
+}
+
+function makeEnemy(typeKey) {
+  const d = ENEMY_DEFS[typeKey];
+  // Spawn just off the left or right edge of the floor band.
+  const fromLeft = Math.random() < 0.5;
+  const x = fromLeft ? -20 : CANVAS_W + 20;
+  const y = rand(FLOOR_TOP + 20, FLOOR_BOTTOM - 20);
+  return {
+    typeKey, isHero: false,
+    animKey: d.animKey, def: d,
+    x, y, facingLeft: !fromLeft, moving: true,
+    hp: d.hp, maxHp: d.hp,
+    animState: 'walk', animFrame: 0, animTimer: 0,
+    attackCooldownTimer: rand(0, 0.5),
+    pendingHit: false, hitDelay: 0,
+    invuln: 0,
+    alive: true, state: 'active',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// GAME STATE
+// ---------------------------------------------------------------------------
+let party = [];
+let activeIndex = 0;
+let enemies = [];
+let projectiles = []; // {x,y,vx,dmg,owner,life}
+let floatingTexts = [];
+let centerMessages = [];
+let waveNumber = 0;
+let waveClearTimer = 0;
+let score = 0;
+let gameOver = false;
+
+function activeHero() { return party[activeIndex]; }
+function heroesAlive() { return party.filter(h => h.state === 'active'); }
+
+function addFloatingText(x, y, text, color) {
+  floatingTexts.push({ x, y, text, color, life: 1.0, vy: -30 });
+}
+function addMessage(text) {
+  centerMessages.push({ text, life: 2.0 });
+}
+
+function resetGame() {
+  party = [
+    makeHero('rogue',  CANVAS_W / 2 - 60, 380),
+    makeHero('cowboy', CANVAS_W / 2,      380),
+    makeHero('ninja',  CANVAS_W / 2 + 60, 380),
+  ];
+  activeIndex = 0;
+  enemies = [];
+  projectiles = [];
+  floatingTexts = [];
+  centerMessages = [];
+  score = 0;
+  waveNumber = 0;
+  waveClearTimer = 0;
+  gameOver = false;
+  startWave();
+}
+
+function startWave() {
+  waveNumber++;
+  const count = 3 + Math.floor(waveNumber * 1.4);
+  for (let i = 0; i < count; i++) {
+    // Weight tougher enemies into later waves.
+    let pool = ['goblin', 'slime'];
+    if (waveNumber >= 2) pool.push('slug');
+    if (waveNumber >= 3) pool.push('bandit');
+    if (waveNumber >= 4) pool.push('frost');
+    const type = pool[randInt(0, pool.length - 1)];
+    enemies.push(makeEnemy(type));
+  }
+  addMessage('Wave ' + waveNumber + ' incoming!');
+}
+
+resetGame();
+
+// ---------------------------------------------------------------------------
+// INPUT
+// ---------------------------------------------------------------------------
+const keys = {};
+window.addEventListener('keydown', (e) => {
+  const k = e.key.toLowerCase();
+  keys[k] = true;
+
+  if (gameOver) {
+    if (k === 'r') resetGame();
+    return;
+  }
+
+  if (k === '1' || k === '2' || k === '3') {
+    const idx = parseInt(k, 10) - 1;
+    if (party[idx] && party[idx].state === 'active') activeIndex = idx;
+    return;
+  }
+  if (k === ' ' || k === 'z') { tryAttack(activeHero()); e.preventDefault(); }
+  if (k === 'e') { trySpecial(activeHero()); }
+  if (k === 'c' || k === 'shift') { tryRoll(activeHero()); }
+});
+window.addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
+
+// ---------------------------------------------------------------------------
+// COMBAT: HERO ACTIONS
+// ---------------------------------------------------------------------------
+function attackCooldownFor(h) { return h.def.attackCooldown; }
+
+function tryAttack(h) {
+  if (!h || h.state !== 'active' || h.rolling) return;
+  if (h.attackCooldownTimer > 0) return;
+
+  // Combo chaining: consecutive attacks within the combo window advance the stage.
+  if (h.comboWindowTimer > 0) {
+    h.comboStage = (h.comboStage % h.def.comboMax) + 1;
+  } else {
+    h.comboStage = 1;
+  }
+  h.comboWindowTimer = 0.9;
+
+  h.animState = 'attack'; h.animFrame = 0; h.animTimer = 0;
+  h.attackCooldownTimer = attackCooldownFor(h);
+
+  const dmgMult = 1 + (h.comboStage - 1) * 0.35; // later hits in a combo hit harder
+  h.rage = Math.min(h.maxRage, h.rage + 6);
+
+  if (h.def.ranged) {
+    // Gunslinger fires immediately rather than waiting for a swing delay.
+    projectiles.push({
+      x: h.x, y: h.y - h.destYOffset || h.y - 40,
+      vx: (h.facingLeft ? -1 : 1) * 620,
+      y0: h.y - 40,
+      dmg: h.def.atkDamage * dmgMult,
+      owner: h, life: 1.0,
+    });
+  } else {
+    h.pendingHit = true;
+    h.hitDelay = attackCooldownFor(h) * 0.4;
+    h.hitDamage = h.def.atkDamage * dmgMult;
+    h.hitRange = h.def.atkRange * (1 + (h.comboStage - 1) * 0.15);
+  }
+}
+
+function trySpecial(h) {
+  if (!h || h.state !== 'active' || h.rolling) return;
+  if (h.attackCooldownTimer > 0) return;
+  if (h.rage < h.maxRage) { addMessage('Rage not full yet!'); return; }
+  h.rage = 0;
+  h.attackCooldownTimer = attackCooldownFor(h) * 1.6;
+  h.comboStage = 0; h.comboWindowTimer = 0;
+
+  if (h.def.specialAnim) {
+    // Kael: plays the Jump Attack sheet from the bonus animation set.
+    h.animState = 'special'; h.animFrame = 0; h.animTimer = 0;
+  } else {
+    h.animState = 'attack'; h.animFrame = 0; h.animTimer = 0;
+  }
+
+  if (h.def.ranged) {
+    // Gunslinger special: a 3-shot burst.
+    for (let i = 0; i < 3; i++) {
+      setTimeout(() => {
+        if (h.state !== 'active') return;
+        projectiles.push({
+          x: h.x, y: h.y - 40,
+          vx: (h.facingLeft ? -1 : 1) * 640,
+          dmg: h.def.atkDamage * 1.6,
+          owner: h, life: 1.0,
+        });
+      }, i * 90);
+    }
+    addMessage(h.name + ' unleashes a Triple Shot!');
+  } else {
+    h.pendingHit = true;
+    h.hitDelay = 0.18;
+    h.hitDamage = h.def.atkDamage * 2.2;
+    h.hitRange = h.def.atkRange * 1.6;
+    addMessage(h.name + ' unleashes a Special Attack!');
+  }
+}
+
+function tryRoll(h) {
+  if (!h || h.state !== 'active' || h.rolling) return;
+  if (h.attackCooldownTimer > 0.05) return;
+  h.rolling = true;
+  h.rollTimer = 0.35;
+  h.invuln = 0.4;
+  let dx = 0, dy = 0;
+  if (keys['w'] || keys['arrowup']) dy -= 1;
+  if (keys['s'] || keys['arrowdown']) dy += 1;
+  if (keys['a'] || keys['arrowleft']) dx -= 1;
+  if (keys['d'] || keys['arrowright']) dx += 1;
+  if (dx === 0 && dy === 0) dx = h.facingLeft ? -1 : 1;
+  const len = Math.hypot(dx, dy) || 1;
+  h.rollDir = { x: dx / len, y: dy / len };
+  if (h.def.rollAnim) { h.animState = 'roll'; h.animFrame = 0; h.animTimer = 0; }
+  else { h.animState = 'walk'; h.animFrame = 0; h.animTimer = 0; }
+}
+
+// ---------------------------------------------------------------------------
+// COMBAT: HIT RESOLUTION
+// ---------------------------------------------------------------------------
+function performHeroHit(h) {
+  const hx = h.x + (h.facingLeft ? -1 : 1) * h.hitRange * 0.6;
+  const hy = h.y - 20;
+  let hitAny = false;
+  for (const en of enemies) {
+    if (en.state !== 'active') continue;
+    if (dist(hx, hy, en.x, en.y - 20) < h.hitRange) {
+      damageEnemy(en, h.hitDamage, h);
+      hitAny = true;
+    }
+  }
+  if (hitAny) h.rage = Math.min(h.maxRage, h.rage + 4);
+}
+
+function damageEnemy(en, dmg, source) {
+  if (en.invuln > 0) return;
+  const d = Math.max(1, Math.round(dmg + rand(-1, 1)));
+  en.hp -= d;
+  en.invuln = 0.15;
+  addFloatingText(en.x, en.y - 60, '-' + d, '#fff06a');
+  if (en.hp <= 0) killEnemy(en, source);
+  else { en.animState = 'hurt'; en.animFrame = 0; en.animTimer = 0; }
+}
+
+function killEnemy(en, source) {
+  en.state = 'dying';
+  en.animState = 'death'; en.animFrame = 0; en.animTimer = 0;
+  const val = ENEMY_DEFS[en.typeKey].scoreVal;
+  score += val;
+  addFloatingText(en.x, en.y - 70, '+' + val, '#8affc1');
+}
+
+function damageHero(h, dmg) {
+  if (h.invuln > 0 || h.state !== 'active') return;
+  h.hp -= dmg;
+  h.invuln = 0.5;
+  addFloatingText(h.x, h.y - 90, '-' + dmg, '#ff6b6b');
+  if (h.hp <= 0) {
+    h.hp = 0;
+    h.state = 'dying';
+    h.animState = 'death'; h.animFrame = 0; h.animTimer = 0;
+    addMessage(h.name + ' has fallen!');
+  } else {
+    h.animState = 'hurt'; h.animFrame = 0; h.animTimer = 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// UPDATE: HEROES
+// ---------------------------------------------------------------------------
+function updateHeroMovement(h, dt) {
+  if (h.state !== 'active') return;
+
+  if (h.rolling) {
+    h.rollTimer -= dt;
+    h.x = clamp(h.x + h.rollDir.x * 340 * dt, 20, CANVAS_W - 20);
+    h.y = clamp(h.y + h.rollDir.y * 340 * dt, FLOOR_TOP, FLOOR_BOTTOM);
+    if (h.rollTimer <= 0) { h.rolling = false; }
+    return;
+  }
+
+  if (h.animState === 'attack' || h.animState === 'special' || h.animState === 'hurt') {
+    h.moving = false;
+    return; // locked in place during an attack / special / hurt animation
+  }
+
+  let dx = 0, dy = 0;
+  if (h === activeHero()) {
+    if (keys['w'] || keys['arrowup']) dy -= 1;
+    if (keys['s'] || keys['arrowdown']) dy += 1;
+    if (keys['a'] || keys['arrowleft']) dx -= 1;
+    if (keys['d'] || keys['arrowright']) dx += 1;
+  }
+
+  if (dx !== 0 || dy !== 0) {
+    const len = Math.hypot(dx, dy);
+    dx /= len; dy /= len;
+    if (dx !== 0) h.facingLeft = dx < 0;
+    h.x = clamp(h.x + dx * h.def.speed * dt, 20, CANVAS_W - 20);
+    h.y = clamp(h.y + dy * h.def.speed * dt, FLOOR_TOP, FLOOR_BOTTOM);
+    h.moving = true;
+    if (h.animState !== 'walk') { h.animState = 'walk'; h.animFrame = 0; h.animTimer = 0; }
+  } else {
+    h.moving = false;
+    if (h.animState === 'walk') { h.animState = 'idle'; h.animFrame = 0; h.animTimer = 0; }
+  }
+}
+
+// Companions (non-active heroes) follow loosely and auto-attack nearby enemies.
+function updateCompanionAI(h, dt) {
+  if (h.state !== 'active' || h === activeHero() || h.rolling) return;
+  if (h.animState === 'attack' || h.animState === 'special' || h.animState === 'hurt') return;
+
+  let nearest = null, nearestDist = Infinity;
+  for (const en of enemies) {
+    if (en.state !== 'active') continue;
+    const d = dist(h.x, h.y, en.x, en.y);
+    if (d < nearestDist) { nearestDist = d; nearest = en; }
+  }
+
+  if (nearest && nearestDist < 220) {
+    const dx = nearest.x - h.x, dy = nearest.y - h.y;
+    const len = Math.hypot(dx, dy) || 1;
+    h.facingLeft = dx < 0;
+    if (nearestDist > h.def.atkRange * 0.8) {
+      h.x = clamp(h.x + (dx / len) * h.def.speed * 0.9 * dt, 20, CANVAS_W - 20);
+      h.y = clamp(h.y + (dy / len) * h.def.speed * 0.9 * dt, FLOOR_TOP, FLOOR_BOTTOM);
+      h.moving = true;
+      if (h.animState !== 'walk') { h.animState = 'walk'; h.animFrame = 0; h.animTimer = 0; }
+    } else {
+      h.moving = false;
+      tryAttack(h);
+    }
+  } else {
+    const target = activeHero();
+    const idx = party.indexOf(h);
+    const offsetX = (idx === 0) ? -50 : 50;
+    const tx = target.x + offsetX, ty = target.y + 20;
+    const dx = tx - h.x, dy = ty - h.y;
+    const d = Math.hypot(dx, dy);
+    if (d > 10) {
+      h.facingLeft = dx < 0;
+      h.x = clamp(h.x + (dx / d) * h.def.speed * 0.8 * dt, 20, CANVAS_W - 20);
+      h.y = clamp(h.y + (dy / d) * h.def.speed * 0.8 * dt, FLOOR_TOP, FLOOR_BOTTOM);
+      h.moving = true;
+      if (h.animState !== 'walk') { h.animState = 'walk'; h.animFrame = 0; h.animTimer = 0; }
+    } else {
+      h.moving = false;
+      if (h.animState === 'walk') { h.animState = 'idle'; h.animFrame = 0; h.animTimer = 0; }
+    }
+  }
+}
+
+function updateHeroTimers(h, dt) {
+  if (h.attackCooldownTimer > 0) h.attackCooldownTimer -= dt;
+  if (h.comboWindowTimer > 0) { h.comboWindowTimer -= dt; if (h.comboWindowTimer <= 0) h.comboStage = 0; }
+  if (h.invuln > 0) h.invuln -= dt;
+  if (h.pendingHit) {
+    h.hitDelay -= dt;
+    if (h.hitDelay <= 0) { performHeroHit(h); h.pendingHit = false; }
+  }
+  if (h.state === 'dying') {
+    // Wait for the death animation to finish, then mark this hero as down.
+    const rowDef = ANIM_DATA[h.animKey].rows.death;
+    if (h.animFrame >= rowDef.count - 1) {
+      h.state = 'down';
+      if (activeHero() === h) {
+        const idx = party.findIndex(p => p.state === 'active');
+        if (idx >= 0) activeIndex = idx;
+      }
+      if (heroesAlive().length === 0) {
+        gameOver = true;
+        addMessage('The party has fallen... Press R to restart.');
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// UPDATE: ENEMIES
+// ---------------------------------------------------------------------------
+function updateEnemy(en, dt) {
+  if (en.invuln > 0) en.invuln -= dt;
+
+  if (en.state === 'dying') {
+    const rowDef = ANIM_DATA[en.animKey].rows.death;
+    if (en.animFrame >= rowDef.count - 1) en.state = 'dead';
+    return;
+  }
+  if (en.state !== 'active') return;
+
+  if (en.animState === 'hurt' || en.animState === 'attack') return; // locked during these
+
+  // Target the nearest active hero.
+  let target = null, best = Infinity;
+  for (const h of party) {
+    if (h.state !== 'active') continue;
+    const d = dist(en.x, en.y, h.x, h.y);
+    if (d < best) { best = d; target = h; }
+  }
+  if (!target) return;
+
+  const def = ENEMY_DEFS[en.typeKey];
+  const dx = target.x - en.x, dy = target.y - en.y;
+  const d = Math.hypot(dx, dy) || 1;
+
+  if (d > def.atkRange) {
+    en.x += (dx / d) * def.speed * dt;
+    en.y = clamp(en.y + (dy / d) * def.speed * dt, FLOOR_TOP, FLOOR_BOTTOM);
+    en.facingLeft = dx < 0;
+    en.moving = true;
+    if (en.animState !== 'walk') { en.animState = 'walk'; en.animFrame = 0; en.animTimer = 0; }
+  } else if (en.attackCooldownTimer <= 0) {
+    en.animState = 'attack'; en.animFrame = 0; en.animTimer = 0;
+    en.attackCooldownTimer = 1.1;
+    en.pendingHit = true; en.hitDelay = 0.3;
+    en.hitDamage = def.damage; en.hitTarget = target;
+  }
+  if (en.attackCooldownTimer > 0) en.attackCooldownTimer -= dt;
+
+  if (en.pendingHit) {
+    en.hitDelay -= dt;
+    if (en.hitDelay <= 0) {
+      en.pendingHit = false;
+      if (en.hitTarget && en.hitTarget.state === 'active' &&
+          dist(en.x, en.y, en.hitTarget.x, en.hitTarget.y) < def.atkRange + 20) {
+        damageHero(en.hitTarget, en.hitDamage);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// UPDATE: PROJECTILES
+// ---------------------------------------------------------------------------
+function updateProjectiles(dt) {
+  for (const pr of projectiles) {
+    pr.x += pr.vx * dt;
+    pr.life -= dt * 0.6;
+    if (pr.x < -20 || pr.x > CANVAS_W + 20) pr.life = 0;
+    for (const en of enemies) {
+      if (en.state !== 'active') continue;
+      if (dist(pr.x, pr.y, en.x, en.y - 30) < 26) {
+        damageEnemy(en, pr.dmg, pr.owner);
+        pr.life = 0;
+        break;
+      }
+    }
+  }
+  projectiles = projectiles.filter(p => p.life > 0);
+}
+
+// ---------------------------------------------------------------------------
+// ANIMATION FRAME ADVANCE (shared by heroes and enemies)
+// ---------------------------------------------------------------------------
+function frameDurationFor(state) {
+  if (state === 'attack' || state === 'special' || state === 'roll') return 0.06;
+  if (state === 'hurt') return 0.12;
+  if (state === 'death') return 0.13;
+  return 0.11; // idle / walk
+}
+
+function rowDefFor(ent) {
+  if (ent.animState === 'special' && ent.def.specialAnim) {
+    return { animKeyOverride: ent.def.specialAnim, rowKey: ent.def.specialRow || 'jumpattack' };
+  }
+  if (ent.animState === 'roll' && ent.def.rollAnim) {
+    return { animKeyOverride: ent.def.rollAnim, rowKey: ent.def.rollRow || 'roll' };
+  }
+  return { animKeyOverride: ent.animKey, rowKey: ent.animState };
+}
+
+function advanceAnim(ent, dt) {
+  ent.animTimer += dt;
+  const dur = frameDurationFor(ent.animState);
+  if (ent.animTimer < dur) return;
+  ent.animTimer = 0;
+
+  const { animKeyOverride, rowKey } = rowDefFor(ent);
+  const sheet = ANIM_DATA[animKeyOverride];
+  const rowDef = sheet.rows[rowKey] || sheet.rows.idle;
+
+  ent.animFrame++;
+  if (ent.animFrame >= rowDef.count) {
+    if (ent.animState === 'death') {
+      ent.animFrame = rowDef.count - 1; // hold final death frame
+    } else if (ent.animState === 'attack' || ent.animState === 'special' || ent.animState === 'hurt' || ent.animState === 'roll') {
+      ent.animFrame = 0;
+      ent.animState = ent.moving ? 'walk' : 'idle';
+    } else {
+      ent.animFrame = 0;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MAIN UPDATE
+// ---------------------------------------------------------------------------
+function update(dt) {
+  if (gameOver) return;
+
+  for (const h of party) {
+    updateHeroMovement(h, dt);
+    updateHeroTimers(h, dt);
+    advanceAnim(h, dt);
+  }
+  for (const h of party) updateCompanionAI(h, dt);
+
+  for (const en of enemies) {
+    updateEnemy(en, dt);
+    advanceAnim(en, dt);
+  }
+  enemies = enemies.filter(en => en.state !== 'dead');
+
+  updateProjectiles(dt);
+
+  floatingTexts.forEach(t => { t.life -= dt; t.y += t.vy * dt * 0.5; });
+  floatingTexts = floatingTexts.filter(t => t.life > 0);
+  centerMessages.forEach(m => m.life -= dt);
+  centerMessages = centerMessages.filter(m => m.life > 0);
+
+  if (enemies.length === 0) {
+    waveClearTimer += dt;
+    if (waveClearTimer > 2.2) { waveClearTimer = 0; startWave(); }
+  }
+
+  updateHUD();
+}
+
+// ---------------------------------------------------------------------------
+// RENDERING
+// ---------------------------------------------------------------------------
+function drawBackground() {
+  // FUTURE: replace this gradient + floor band with real tileset drawImage() calls
+  // (the user has full Golden-Axe-style ground / dungeon / forest tilesets ready).
+  const grad = ctx.createLinearGradient(0, 0, 0, CANVAS_H);
+  grad.addColorStop(0, '#1c1428');
+  grad.addColorStop(0.4, '#3a2a1e');
+  grad.addColorStop(1, '#241a12');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+  // Simple floor band to suggest the brawler's walkable lane.
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  ctx.fillRect(0, FLOOR_TOP - 20, CANVAS_W, (FLOOR_BOTTOM + 60) - (FLOOR_TOP - 20));
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  for (let x = 0; x < CANVAS_W; x += 40) {
+    ctx.beginPath(); ctx.moveTo(x, FLOOR_TOP - 20); ctx.lineTo(x, FLOOR_BOTTOM + 60); ctx.stroke();
+  }
+}
+
+function drawShadow(x, y, r) {
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.beginPath();
+  ctx.ellipse(x, y + 4, r, r * 0.35, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// Depth scale: characters lower on screen (closer to camera) render slightly larger.
+function depthScale(y) { return 0.82 + 0.34 * ((y - FLOOR_TOP) / (FLOOR_BOTTOM - FLOOR_TOP)); }
+
+function drawEntitySprite(ent) {
+  const { animKeyOverride, rowKey } = rowDefFor(ent);
+  const sheet = ANIM_DATA[animKeyOverride];
+  const rowDef = sheet.rows[rowKey] || sheet.rows.idle;
+  const frameIdx = Math.min(ent.animFrame, rowDef.count - 1);
+  const sx = rowDef.x0 + frameIdx * rowDef.pitch;
+  const sy = rowDef.row * sheet.rowH;
+  const sw = rowDef.pitch, sh = sheet.rowH;
+  const img = IMAGES[sheet.sheet];
+
+  const scale = depthScale(ent.y);
+  const destW = ent.def.destW * scale;
+  const destH = ent.def.destH * scale;
+
+  drawShadow(ent.x, ent.y, destW * 0.32);
+
+  ctx.save();
+  ctx.translate(ent.x, ent.y);
+  // Flash white briefly when hurt/invulnerable for visual feedback.
+  if (ent.invuln > 0 && Math.floor(ent.invuln * 20) % 2 === 0) {
+    ctx.globalAlpha = 0.55;
+  }
+  if (ent.facingLeft) ctx.scale(-1, 1);
+  ctx.drawImage(img, sx, sy, sw, sh, -destW / 2, -destH, destW, destH);
+  ctx.restore();
+
+  // HP sliver above the character's head.
+  const barW = destW * 0.9;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(ent.x - barW / 2, ent.y - destH - 12, barW, 4);
+  ctx.fillStyle = ent.isHero ? '#f66' : '#e63946';
+  ctx.fillRect(ent.x - barW / 2, ent.y - destH - 12, barW * clamp(ent.hp / ent.maxHp, 0, 1), 4);
+
+  if (ent.isHero) {
+    ctx.fillStyle = '#fff';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(ent.name, ent.x, ent.y - destH - 16);
+    if (ent === activeHero()) {
+      ctx.strokeStyle = '#f4d35e';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.ellipse(ent.x, ent.y + 2, destW * 0.4, destW * 0.16, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+}
+
+function drawProjectiles() {
+  for (const pr of projectiles) {
+    ctx.fillStyle = '#ffe66d';
+    ctx.beginPath();
+    ctx.ellipse(pr.x, pr.y, 6, 3, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function drawFloatingTexts() {
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 12px monospace';
+  for (const t of floatingTexts) {
+    ctx.globalAlpha = clamp(t.life, 0, 1);
+    ctx.fillStyle = t.color;
+    ctx.fillText(t.text, t.x, t.y);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawCenterMessages() {
+  if (centerMessages.length === 0) return;
+  const m = centerMessages[centerMessages.length - 1];
+  ctx.save();
+  ctx.globalAlpha = clamp(m.life / 2.0, 0, 1);
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.font = 'bold 18px monospace';
+  const w = ctx.measureText(m.text).width + 30;
+  ctx.fillRect(CANVAS_W / 2 - w / 2, 30, w, 34);
+  ctx.fillStyle = '#f4d35e';
+  ctx.textAlign = 'center';
+  ctx.fillText(m.text, CANVAS_W / 2, 53);
+  ctx.restore();
+}
+
+function drawGameOver() {
+  if (!gameOver) return;
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+  ctx.fillStyle = '#e63946';
+  ctx.font = 'bold 30px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('THE PARTY HAS FALLEN', CANVAS_W / 2, CANVAS_H / 2 - 20);
+  ctx.fillStyle = '#fff';
+  ctx.font = '16px monospace';
+  ctx.fillText('Final Score: ' + score, CANVAS_W / 2, CANVAS_H / 2 + 10);
+  ctx.fillText('Press R to restart', CANVAS_W / 2, CANVAS_H / 2 + 36);
+  ctx.restore();
+}
+
+function render() {
+  drawBackground();
+
+  // Simple y-sort so characters lower on screen draw in front of ones further back.
+  const drawables = [...party.filter(h => h.state !== 'down'), ...enemies];
+  drawables.sort((a, b) => a.y - b.y);
+  for (const ent of drawables) drawEntitySprite(ent);
+
+  drawProjectiles();
+  drawFloatingTexts();
+  drawCenterMessages();
+  drawGameOver();
+
+  ctx.fillStyle = '#fff';
+  ctx.font = '12px monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText('Score: ' + score + '   Wave: ' + waveNumber, CANVAS_W - 10, 20);
+}
+
+// ---------------------------------------------------------------------------
+// HUD
+// ---------------------------------------------------------------------------
+const hudEl = document.getElementById('hud');
+function updateHUD() {
+  let html = '';
+  party.forEach((h, i) => {
+    const isActive = i === activeIndex;
+    const hpPct = clamp((h.hp / h.maxHp) * 100, 0, 100);
+    const ragePct = clamp((h.rage / h.maxRage) * 100, 0, 100);
+    html += '<div class="charPanel ' + (isActive ? 'active' : '') + ' ' + (h.state === 'down' ? 'dead' : '') + '">';
+    html += '<div class="charName">' + (i + 1) + '. ' + h.name + ' <span>' + h.role + '</span></div>';
+    html += '<div class="barBg"><div class="barFill hpFill" style="width:' + hpPct + '%"></div></div>';
+    html += '<div class="charName" style="font-size:10px;color:#bcd;">HP ' + Math.max(0, Math.round(h.hp)) + ' / ' + h.maxHp + '</div>';
+    html += '<div class="barBg"><div class="barFill rageFill" style="width:' + ragePct + '%"></div></div>';
+    html += '<div class="charName" style="font-size:10px;color:#bcd;">Rage ' + Math.round(ragePct) + '% ' + (h.state === 'down' ? ' — DOWN' : (h.rage >= h.maxRage ? ' — READY! (E)' : '')) + '</div>';
+    html += '<div class="charName" style="font-size:10px;color:#9aa;">Combo x' + h.comboStage + '</div>';
+    html += '</div>';
+  });
+  hudEl.innerHTML = html;
+}
+updateHUD();
+
+// ---------------------------------------------------------------------------
+// MAIN LOOP
+// ---------------------------------------------------------------------------
+let lastTime = performance.now();
+function loop(now) {
+  const dt = Math.min((now - lastTime) / 1000, 0.05);
+  lastTime = now;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* =====================================================================================
+   MORE FUTURE-PROOFING NOTES
+   -------------------------------------------------------------------------------------
+   - CAMERA SCROLLING: this prototype is a single fixed screen (classic Golden Axe
+     "arena" encounter). To make a scrolling level, add a `cameraX` value, move the
+     world instead of the player near screen edges, and offset every draw call by
+     `-cameraX`.
+   - MORE COMBOS: comboStage currently just scales damage/range. For true Golden-
+     Axe/Dragon's-Crown-style combos, give each comboStage its own frame row (e.g.
+     attack1/attack2/attack3) sliced from a wider attack strip, and swap rowKey based
+     on comboStage instead of always using 'attack'.
+   - REAL SPECIAL SPRITES: Roy and Shiro currently reuse their normal Attack frames
+     for Special (just bigger numbers). Slice a dedicated special-move sheet for them
+     the same way rogueextra was added, and point specialAnim/specialRow at it.
+   - ATTACK EFFECTS: the user has a dedicated slash/impact VFX sheet -- slice it the
+     same way as the character sheets and spawn a short-lived sprite effect at hit
+     time inside damageEnemy()/performHeroHit() instead of the floating "-12" text.
+   - BOSSES: add an ENEMY_DEFS entry with a large destW/destH, high HP, and a second
+     attack pattern (e.g. a ranged lunge) gated behind an internal state machine.
+   ===================================================================================== */
+</script>
+</body>
+</html>
